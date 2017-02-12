@@ -1,6 +1,7 @@
 import imageio
 import numpy as np
 import tensorflow as tf
+from tensorflow.contrib.layers import l2_regularizer
 
 class R3Cell(tf.nn.rnn_cell.RNNCell):
     def __init__(self, num_blocks, num_objects, score_fr_shp):
@@ -21,9 +22,12 @@ class R3Cell(tf.nn.rnn_cell.RNNCell):
         return 2 * self._num_blocks * self._num_objects
 
     def __call__(self, inputs, state, scope=None):
+        # Initialization and Regularization (Self-explanatory)
         initializer = tf.random_uniform_initializer(-0.1, 0.1, dtype=tf.float32)
-        regularizer = tf.nn.l2_normalize(.0005)
+        regularizer = l2_regularizer(.0005)
 
+        # Ensures that at call time, if the variables exist
+        # We don't recreate them.
         def get_variable(name, shape):
             return tf.get_variable(name, shape, initializer=initializer,
                                    regularizer=regularizer, dtype=tf.float32)
@@ -33,12 +37,13 @@ class R3Cell(tf.nn.rnn_cell.RNNCell):
             num_objects, num_blocks = self._num_objects, self._num_blocks
             score_fr = tf.reshape(inputs, self.score_fr_shp)
             height, width = score_fr.get_shape()[1:3]
-            g = h = tf.tanh
 
+            g = h = tf.tanh
             c_prev, y_prev = tf.split(1, 2, state)
             y_prev = tf.reshape(y_prev, [num_objects, num_blocks])
             c_prev = tf.reshape(c_prev, [num_objects, num_blocks])
 
+            # Einstein Summations for Higher Rank LSTM Operations
             def ex(m1, m2):
                 return tf.einsum('bjki,ijkm-> im', m1, m2)
 
@@ -83,24 +88,33 @@ class R3Cell(tf.nn.rnn_cell.RNNCell):
 
 class R3:
     def __init__(self, full_height, full_width, num_objects, num_blocks, batch=1, channels=3):
-        initializer = tf.truncated_normal_initializer(0.0, 0.1, dtype=tf.float32)
-        regularizer = tf.nn.l2_normalize(.0005)
 
+        # Initialization and Regularization (Self-explanatory)
+        initializer = tf.truncated_normal_initializer(0.0, 0.1, dtype=tf.float32)
+        regularizer = l2_regularizer(.0005)
+
+        # We don't need to always use this, but it helps us stay consistent
         def get_variable(name, shape):
             return tf.get_variable(name, shape, initializer=initializer,
                                    regularizer=regularizer, dtype=tf.float32)
 
+        # Returns a 2d Convolution Operation after Initializing Weights
+        # The name input, as labelled is actually for the filter rather than
+        # the convolution operation itself.
         def conv2d(x, filter_name, filter_shape):
             w = get_variable(filter_name, filter_shape)
             return tf.nn.relu(tf.nn.conv2d(x, w, [1, 1, 1, 1], padding="SAME"))
 
+        # Self Explanatory
         def maxPool(x):
             return tf.nn.max_pool(x, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1], padding="SAME")
 
+        # Returns the Deconvolution (or Convolution Transpose) Operation
         def deconv2d(x, output_shp, filter_name, filter_shape, stride):
             w = tf.get_variable(filter_name, filter_shape)
             return tf.nn.conv2d_transpose(x, w, output_shp, [1, stride, stride, 1])
 
+        # Returns the filter shapes for conv2d and deconv2d
         def fil_sh(p_fshp, fshp, sz=3):
             return [sz, sz, p_fshp, fshp]
 
@@ -166,33 +180,40 @@ class R3:
             inputs = tf.reshape(score_fr, [1, 1, -1])
             score_fr_shp = score_fr.get_shape()
 
+        # LSTM Steps
+        # Dynamic RNN can take variable lengths so we'll use that
+        # eventually.
         cell = R3Cell(num_blocks, num_objects, score_fr_shp)
-
         output, state = tf.nn.dynamic_rnn(cell=cell, inputs=inputs,
                                           dtype=tf.float32)
+
+        # Take LSTM Output and Transorm->Multiply to shape of Score_fr
+        # Equivalent to using a fully connected layer to get the
+        # dimensions we want.
         output_rshp = tf.reshape(output, [num_objects, num_blocks])
         W_nst = get_variable("W_nst", [num_blocks, *score_fr_shp[1:]])
         nst = tf.expand_dims(tf.einsum('ij,jkli->kli', output_rshp, W_nst), axis=0)
 
-        # Upsampling
+        # Upsampling -- We are gonna turn it into a picture again
         with tf.variable_scope("upsampling"):
             output_shp = tf.stack([*pool4.get_shape()[:3], tf.Dimension(num_objects)])
             upscore2 = deconv2d(nst, output_shp, "defilter2", fil_sh(fshp, fshp, 4), 2)
 
-        # Fuse With Pool4
+        # Fuse With Pool4 and Upsample
         with tf.variable_scope("upsampling_p4"):
             score_pool4 = conv2d(pool4, "filter_p4", fil_sh(fl_fshp4, fshp, 1))
             fuse_pool4 = tf.add(upscore2, score_pool4)
             output_shp = tf.stack([*pool3.get_shape()[:3], tf.Dimension(num_objects)])
             upscore_pool4 = deconv2d(fuse_pool4, output_shp, "defilter4", fil_sh(fshp, fshp, 4), 2)
 
-        # Fuse with Pool3
+        # Fuse with Pool3 and Upsample
         with tf.variable_scope("upsampling_p3"):
             score_pool3 = conv2d(pool3, "filter_p3", fil_sh(fl_fshp3, fshp, 1))
             fuse_pool3 = tf.add(upscore_pool4, score_pool3)
             output_shp = tf.stack([1, full_height, full_width, channels])
             upscore8 = deconv2d(fuse_pool3, output_shp, "defilter8", fil_sh(channels, fshp, 16), 8)
 
+        # Train, Loss, and Optimizer
         with tf.variable_scope("train"):
             loss = tf.reduce_mean(tf.square(tf.sub(correct, upscore8)))
             optimizer = tf.train.AdamOptimizer()
